@@ -206,6 +206,10 @@ Shortcut to get WorxVPN extension logs.
 - Crash reports are found in `~/Library/Logs/DiagnosticReports`
 - Exported logs are saved to `~/Desktop/ConsoleMCP-Exports/`
 
+## Credits
+
+Originally created by [devstroop](https://github.com/devstroop/console-mcp). This fork includes custom modifications and enhancements.
+
 ## License
 
 MIT
