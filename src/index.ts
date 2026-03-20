@@ -44,6 +44,71 @@ interface Simulator {
 
 // Get list of connected iOS devices
 function getConnectedDevices(): Device[] {
+  const hasCommand = (command: string) => {
+    try {
+      execSync(`which ${command}`, { encoding: "utf-8" });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const parseIdeviceInfo = (raw: string) => {
+    const info = new Map<string, string>();
+    for (const line of raw.split("\n")) {
+      const idx = line.indexOf(":");
+      if (idx === -1) continue;
+      const key = line.slice(0, idx).trim();
+      const value = line.slice(idx + 1).trim();
+      if (key) info.set(key, value);
+    }
+    return info;
+  };
+
+  // Prefer libimobiledevice when available because idevicesyslog uses iOS UDIDs
+  // (xcrun devicectl "Identifier" is a CoreDevice UUID and doesn't work with idevicesyslog).
+  if (hasCommand("idevice_id") && hasCommand("ideviceinfo")) {
+    try {
+      const udids = execSync("idevice_id -l 2>/dev/null", {
+        encoding: "utf-8",
+        timeout: 10000,
+      })
+        .split("\n")
+        .map((l) => l.trim())
+        .filter(Boolean);
+
+      const devices: Device[] = [];
+      for (const udid of udids) {
+        let deviceName = udid;
+        let model = "Unknown";
+        let connectionType = "USB";
+
+        try {
+          const infoRaw = execSync(`ideviceinfo -u ${udid} -s 2>/dev/null`, {
+            encoding: "utf-8",
+            timeout: 10000,
+          });
+          const info = parseIdeviceInfo(infoRaw);
+          deviceName = info.get("DeviceName") || deviceName;
+          const productType = info.get("ProductType");
+          const productVersion = info.get("ProductVersion");
+          model = [productType, productVersion ? `(iOS ${productVersion})` : ""]
+            .filter(Boolean)
+            .join(" ");
+          const conn = info.get("ConnectionType");
+          if (conn) connectionType = conn;
+        } catch {
+          // best-effort; fall back to UDID-only
+        }
+
+        devices.push({ udid, name: deviceName, model, connectionType });
+      }
+      return devices;
+    } catch {
+      // fall back to devicectl
+    }
+  }
+
   try {
     const output = execSync("xcrun devicectl list devices 2>/dev/null", {
       encoding: "utf-8",
@@ -140,7 +205,7 @@ async function getDeviceLogs(
       // Use idevicesyslog for real device logs
       const args = ["-u", udid];
       if (process) {
-        args.push("-m", process); // Match process name
+        args.push("-p", process); // Filter by process name
       }
       
       const child = spawn("idevicesyslog", args);
@@ -161,9 +226,9 @@ async function getDeviceLogs(
           output += `[stderr] ${errMsg}`;
         }
       });
-      
+
       // Collect for a short duration since idevicesyslog is real-time
-      const collectDuration = Math.min(lastMinutes * 1000, 10000); // Max 10 seconds
+      const collectDuration = Math.min(lastMinutes * 60 * 1000, 10 * 60 * 1000); // Max 10 minutes
       setTimeout(() => {
         child.kill("SIGTERM");
         resolve(output || `No logs captured from device ${udid}`);
@@ -381,28 +446,15 @@ async function streamDeviceLogs(
   durationSeconds: number = 10
 ): Promise<string> {
   return new Promise((resolve) => {
-    // Try idevicesyslog first (from libimobiledevice)
-    let child: ReturnType<typeof spawn>;
-    let output = "";
-    
-    try {
-      // Check if idevicesyslog is available
-      execSync("which idevicesyslog", { encoding: "utf-8" });
-      
-      const args = ["-u", udid];
-      if (process) {
-        args.push("-p", process);
-      }
-      
-      child = spawn("idevicesyslog", args);
-    } catch {
-      // Fallback to xcrun devicectl or log stream
-      const args = ["stream", "--style", "compact"];
-      if (process) {
-        args.push("--predicate", `processImagePath CONTAINS "${process}"`);
-      }
-      child = spawn("log", args);
+    // Stream macOS logs (uses `log stream`). For iOS devices use get_device_logs
+    // or provide a device to stream via idevicesyslog in the tool handler.
+    const args = ["stream", "--style", "compact"];
+    if (process) {
+      args.push("--predicate", `processImagePath CONTAINS "${process}"`);
     }
+
+    const child = spawn("log", args);
+    let output = "";
     
     child.stdout?.on("data", (data: Buffer) => {
       output += data.toString();
@@ -421,6 +473,44 @@ async function streamDeviceLogs(
     child.on("error", (err) => {
       resolve(`Error: ${err.message}`);
     });
+  });
+}
+
+async function streamIOSDeviceLogs(
+  udid: string,
+  process?: string,
+  durationSeconds: number = 10
+): Promise<string> {
+  return new Promise((resolve) => {
+    let output = "";
+
+    try {
+      execSync("which idevicesyslog", { encoding: "utf-8" });
+    } catch {
+      resolve(
+        `⚠️ idevicesyslog not found.\n\nTo stream iOS device logs:\n  brew install libimobiledevice`
+      );
+      return;
+    }
+
+    const args = ["-u", udid];
+    if (process) args.push("-p", process);
+
+    const child = spawn("idevicesyslog", args);
+
+    child.stdout.on("data", (data: Buffer) => {
+      output += data.toString();
+    });
+    child.stderr.on("data", (data: Buffer) => {
+      output += data.toString();
+    });
+
+    setTimeout(() => {
+      child.kill("SIGTERM");
+      resolve(output || "No logs captured during stream");
+    }, durationSeconds * 1000);
+
+    child.on("error", (err) => resolve(`Error: ${err.message}`));
   });
 }
 
@@ -715,6 +805,78 @@ async function watchForPattern(
         child.kill("SIGTERM");
         resolve({ found: false, matchedLine: "", allOutput: output + "\n\n⏱️ Timeout reached without finding pattern." });
       }
+    }, timeoutSeconds * 1000);
+  });
+}
+
+async function watchForPatternOnIOSDevice(
+  udid: string,
+  pattern: string,
+  useRegex: boolean = false,
+  process?: string,
+  timeoutSeconds: number = 30
+): Promise<{ found: boolean; matchedLine: string; allOutput: string }> {
+  return new Promise((resolve) => {
+    let output = "";
+    let found = false;
+    let matchedLine = "";
+
+    try {
+      execSync("which idevicesyslog", { encoding: "utf-8" });
+    } catch {
+      resolve({
+        found: false,
+        matchedLine: "",
+        allOutput: `⚠️ idevicesyslog not found. Install with: brew install libimobiledevice`,
+      });
+      return;
+    }
+
+    let matcher: (line: string) => boolean;
+    if (useRegex) {
+      try {
+        const regex = new RegExp(pattern, "i");
+        matcher = (line: string) => regex.test(line);
+      } catch (e) {
+        resolve({ found: false, matchedLine: "", allOutput: `Invalid regex: ${e}` });
+        return;
+      }
+    } else {
+      const patternLower = pattern.toLowerCase();
+      matcher = (line: string) => line.toLowerCase().includes(patternLower);
+    }
+
+    const args = ["-u", udid];
+    if (process) args.push("-p", process);
+    const child = spawn("idevicesyslog", args);
+
+    child.stdout.on("data", (data: Buffer) => {
+      const lines = data.toString().split("\n");
+      for (const line of lines) {
+        if (!line) continue;
+        output += line + "\n";
+        if (!found && matcher(line)) {
+          found = true;
+          matchedLine = line;
+          child.kill("SIGTERM");
+        }
+      }
+    });
+
+    child.stderr.on("data", (data: Buffer) => {
+      output += data.toString();
+    });
+
+    child.on("close", () => {
+      resolve({ found, matchedLine, allOutput: output });
+    });
+
+    child.on("error", (err) => {
+      resolve({ found: false, matchedLine: "", allOutput: `Error: ${err.message}` });
+    });
+
+    setTimeout(() => {
+      if (!found) child.kill("SIGTERM");
     }, timeoutSeconds * 1000);
   });
 }
@@ -1221,13 +1383,32 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
       
       case "stream_logs": {
+        const deviceId = args?.device as string | undefined;
         const process = args?.process as string | undefined;
         const duration = Math.min((args?.durationSeconds as number) || 10, 30);
-        
+
+        if (deviceId) {
+          const device = findDevice(deviceId);
+          if (!device) {
+            const devices = getConnectedDevices();
+            return {
+              content: [
+                {
+                  type: "text",
+                  text:
+                    `Device "${deviceId}" not found.\n\nAvailable devices:\n` +
+                    (devices.length ? devices.map((d) => `- ${d.name} (${d.udid})`).join("\n") : "(none)"),
+                },
+              ],
+            };
+          }
+
+          const logs = await streamIOSDeviceLogs(device.udid, process, duration);
+          return { content: [{ type: "text", text: `📱 Streamed logs from ${device.name}:\n\n${logs}` }] };
+        }
+
         const logs = await streamDeviceLogs("", process, duration);
-        return {
-          content: [{ type: "text", text: logs }],
-        };
+        return { content: [{ type: "text", text: logs }] };
       }
       
       case "stream_simulator_logs": {
@@ -1313,6 +1494,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const pattern = args?.pattern as string;
         const useRegex = args?.useRegex as boolean || false;
         const process = args?.process as string | undefined;
+        const deviceId = args?.device as string | undefined;
         const timeoutSeconds = Math.min((args?.timeoutSeconds as number) || 30, 60);
         
         if (!pattern) {
@@ -1321,7 +1503,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
         
-        const result = await watchForPattern(pattern, useRegex, process, timeoutSeconds);
+        const result = await (deviceId
+          ? (() => {
+              const device = findDevice(deviceId);
+              if (!device) {
+                return Promise.resolve({
+                  found: false,
+                  matchedLine: "",
+                  allOutput: `Device "${deviceId}" not found.`,
+                });
+              }
+              return watchForPatternOnIOSDevice(
+                device.udid,
+                pattern,
+                useRegex,
+                process,
+                timeoutSeconds
+              );
+            })()
+          : watchForPattern(pattern, useRegex, process, timeoutSeconds));
         
         if (result.found) {
           return {

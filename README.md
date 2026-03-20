@@ -20,7 +20,8 @@ An MCP (Model Context Protocol) server for accessing macOS and iOS device logs d
 ## Installation
 
 ```bash
-cd /Users/itsalfredakku/McpServers/console-mcp
+git clone https://github.com/rohithgoud30/console-mcp.git
+cd console-mcp
 npm install
 npm run build
 ```
@@ -42,7 +43,7 @@ Add to your `.vscode/mcp.json`:
   "servers": {
     "console": {
       "command": "node",
-      "args": ["/Users/itsalfredakku/McpServers/console-mcp/dist/index.js"]
+      "args": ["/path/to/console-mcp/dist/index.js"]
     }
   }
 }
