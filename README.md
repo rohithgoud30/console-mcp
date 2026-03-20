@@ -1,6 +1,8 @@
-# Console MCP Server
+# Console MCP Server — macOS & iOS Log Streaming for AI Assistants
 
-An MCP (Model Context Protocol) server for accessing macOS and iOS device logs directly from VS Code / Copilot.
+An [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server for streaming and searching macOS Console.app and iOS device logs directly from Claude, GitHub Copilot, or any MCP-compatible AI assistant.
+
+Stream real-time logs, search crash reports, filter by severity, and debug iOS simulators and physical devices — all through natural language.
 
 ## Features
 
